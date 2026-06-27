@@ -1,4 +1,4 @@
-Extract and drop into eternal/mods (sorry for the zip file the site forced me to use some sort of compressed file type)
+Extract and drop into eternal/mods 
 
 Currently supported on NIGHTLY only! It might work on stable but it is untested.
 
