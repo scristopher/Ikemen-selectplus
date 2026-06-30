@@ -1,11 +1,11 @@
 --=============================================================================
--- selectplus.lua 
+--selectplus.lua 
 --=============================================================================
--- Drop this file in  external/mods/ 
+--Drop this file in  external/mods/ 
 --=============================================================================
 
 local selectplus = {}
-selectplus.version = '0.7-edgepaging'
+selectplus.version = '0.10.1-filterhud'
 
 --=============================================================================
 -- CONFIGURATION  edit this section to customise
@@ -17,7 +17,7 @@ selectplus.version = '0.7-edgepaging'
 selectplus.PageScrolling = {
     enabled    = true,
     controller = { prev = 'd',      next = 'w'        },  -- controller L1 / L2
-    keyboard   = { prev = 'PAGEUP', next = 'PAGEDOWN' },  -- keyboard
+    keyboard   = { prev = 'PAGEUP', next = 'PAGEDOWN' },  -- keyboard PGUP/PGDN
     edgePaging = true,  -- push RIGHT off the last cell -> next page; LEFT off the
                         -- first cell -> previous page. Corners are read from the motif (columns/rows)
     readoutY   = 110,   -- for the PAGE N/N info line
@@ -104,12 +104,14 @@ end
 --PAGING + SEARCH 
 --------------------------------------------------------------------------------
 start.rosterPage = start.rosterPage or {current = 1, pageSize = 0, total = 1}
-start.rosterFilter    = nil 
+start.rosterFilter    = nil
 start.rosterNameCache = nil
+start.rosterAuthorCache = nil
 start.searchMode      = false
 start.searchQuery     = ''
 start.searchCloseGuard = 0
 start.kbIndex         = 1
+start.kbTypeGuard     = 0
 start.ROSTER_CELL_EMPTY = -1
 
 function start.f_rosterCount()
@@ -126,10 +128,10 @@ function start.f_updateRosterPageTotals()
 	elseif rp.current > rp.total then rp.current = rp.total end
 end
 
--- Map a visible cell to its roster index 
+--Map a visible cell to its roster index 
 function start.f_pageCell(cell)
 	local rp = start.rosterPage
-	-- pageSize is constant for this session, map it once instead of every call
+	--pageSize is constant for this session, map it once instead of every call
 	if rp.pageSize == 0 then rp.pageSize = motif.select_info.rows * motif.select_info.columns end
 	local pos = (rp.current - 1) * rp.pageSize + cell
 	if start.rosterFilter ~= nil then
@@ -202,39 +204,70 @@ end
 --------------------------------------------------------------------------------
 --SEARCH
 --------------------------------------------------------------------------------
---Build a lowercase name index keyed to roster position
+--Build lowercase name and author indexes keyed to roster position (author comes free from getCharInfo)
 function start.f_buildNameCache()
-	local cache = {}
+	local nameCache, authorCache = {}, {}
 	for i = 1, #main.t_selGrid do
-		local nm = ''
+		local nm, au = '', ''
 		local gc = main.t_selGrid[i]
 		if gc ~= nil and gc.chars ~= nil and #gc.chars > 0 then
 			local cd = main.t_selChars[gc.chars[gc.slot or 1]]
-			if cd ~= nil and cd.name ~= nil then nm = cd.name:lower() end
+			--Skip characters a user has hidden from the grid so they don't appear in search results
+			if cd ~= nil and cd.name ~= nil and cd.hidden ~= 2 and cd.exclude ~= 1 and cd.bonus ~= 1 then
+				nm = cd.name:lower()
+				au = (cd.author or ''):lower()
+			end
 		end
-		cache[i] = nm
+		nameCache[i]   = nm
+		authorCache[i] = au
 	end
-	start.rosterNameCache = cache
+	start.rosterNameCache   = nameCache
+	start.rosterAuthorCache = authorCache
 end
 
---Apply a name filter, where nil clears it and empty matches nothing
+--Apply a search filter, where nil clears it and an empty query matches nothing.
+--A leading '@' searches the author field instead of the name (e.g. '@pots').
 function start.f_applyFilter(query)
 	if query == nil then
 		start.rosterFilter = nil
-	elseif query == '' then
+		start.f_finishFilter()
+		return
+	end
+	if start.rosterNameCache == nil then start.f_buildNameCache() end
+	local authorMode = query:sub(1, 1) == '@'
+	local cache = authorMode and start.rosterAuthorCache or start.rosterNameCache
+	local q = (authorMode and query:sub(2) or query):lower()
+	if q == '' then
 		start.rosterFilter = {}
-	else
-		if start.rosterNameCache == nil then start.f_buildNameCache() end
-		local q    = query:lower()
-		local filt = {}
-		for i = 1, #main.t_selGrid do
-			local nm = start.rosterNameCache[i]
-			if nm ~= nil and nm ~= '' and nm:find(q, 1, true) ~= nil then
-				filt[#filt + 1] = i
+		start.f_finishFilter()
+		return
+	end
+	--Score matches (exact beats prefix beats contains, shorter value wins ties) so the closest lands first.
+	local matches = {}
+	for i = 1, #main.t_selGrid do
+		local s = cache[i]
+		if s ~= nil and s ~= '' then
+			local at = s:find(q, 1, true)
+			if at ~= nil then
+				local score = 2
+				if s == q then score = 0 elseif at == 1 then score = 1 end
+				matches[#matches + 1] = {idx = i, score = score, len = #s}
 			end
 		end
-		start.rosterFilter = filt
 	end
+	table.sort(matches, function(a, b)
+		if a.score ~= b.score then return a.score < b.score end
+		if a.len   ~= b.len   then return a.len   < b.len   end
+		return a.idx < b.idx
+	end)
+	local filt = {}
+	for k = 1, #matches do filt[k] = matches[k].idx end
+	start.rosterFilter = filt
+	start.f_finishFilter()
+end
+
+--Reset to the first page, recompute totals, redraw the grid and snap the cursor to the top-left.
+function start.f_finishFilter()
 	start.rosterPage.current = 1
 	start.f_updateRosterPageTotals()
 	start.f_refreshRosterPageGrid()
@@ -277,15 +310,15 @@ end
 --------------------------------------------------------------------------------
 --ICON RESIZE
 --------------------------------------------------------------------------------
--- Capture the motif's original sizes once so every resize is computed from them without drift.
+--Capture the motif's original sizes once so every resize is computed from them without drift.
 local _irInit             = false
-local _ctrlHeld           = {}    -- per-side latch for shoulder-button rising edges
-local _irOrigGrid         = {}    -- [row][col] = {x, y}
-local _irOrigPortraitSc   = nil   -- portrait.scale  {x, y}  (default {1,1} if nil)
-local _irOrigPortraitOff  = nil   -- portrait.offset {x, y}
-local _irOrigBgSc         = nil   -- cell.bg.scale   {x, y}
-local _irOrigRandomSc     = nil   -- cell.random.scale {x, y}
-local _irOrigCellSize     = nil   -- cell.size  {w, h}  (used by cursor wrap check)
+local _ctrlHeld           = {}    --per-side latch for shoulder-button rising edges
+local _irOrigGrid         = {}    --[row][col] = {x, y}
+local _irOrigPortraitSc   = nil   --portrait.scale  {x, y}  (default {1,1} if nil)
+local _irOrigPortraitOff  = nil   --portrait.offset {x, y}
+local _irOrigBgSc         = nil   --cell.bg.scale   {x, y}
+local _irOrigRandomSc     = nil   --cell.random.scale {x, y}
+local _irOrigCellSize     = nil   --cell.size  {w, h}  (used by cursor wrap check)
 
 local function initIconResize()
 	if _irInit then return end
@@ -353,7 +386,7 @@ end
 local function cycleIconSizePreset()
 	local ir = selectplus.IconResize
 	local p  = ir.presets
-	if p == nil or #p == 0 then            -- Fall back
+	if p == nil or #p == 0 then            --Fall back
 		applyIconResize(ir.scale + ir.scaleStep)
 		return
 	end
@@ -385,8 +418,8 @@ end
 function start.f_controllerSelectInput(side, cmd, player)
 	local ps = selectplus.PageScrolling
 	local ir = selectplus.IconResize
-	local prevHeld = ps.enabled and getInput(cmd, ps.controller.prev) and true or false  -- L1 = 'd'
-	local nextHeld = ps.enabled and getInput(cmd, ps.controller.next) and true or false  -- L2 = 'w'
+	local prevHeld = ps.enabled and getInput(cmd, ps.controller.prev) and true or false  --L1 = 'd'
+	local nextHeld = ps.enabled and getInput(cmd, ps.controller.next) and true or false  --L2 = 'w'
 	local h = _ctrlHeld[side]
 	if h == nil then h = {} _ctrlHeld[side] = h end
 
@@ -401,7 +434,7 @@ function start.f_controllerSelectInput(side, cmd, player)
 	local paged = false
 	if h.prev and not prevHeld and not h.combo then paged = changePage(-1) or paged end
 	if h.next and not nextHeld and not h.combo then paged = changePage(1)  or paged end
-	if not prevHeld and not nextHeld then h.combo = false end  -- Reset once both are released.
+	if not prevHeld and not nextHeld then h.combo = false end  --Reset once both are released.
 	h.prev, h.next = prevHeld, nextHeld
 	if paged then return true end
 
@@ -437,6 +470,7 @@ do
 	for c in ('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'):gmatch('.') do
 		keys[#keys + 1] = {label = c, type = 'char', ch = c:lower()}
 	end
+	keys[#keys + 1] = {label = '@', type = 'char', ch = '@'}   --leading '@' switches to author search
 	keys[#keys + 1] = {label = 'SPC', type = 'space'}
 	keys[#keys + 1] = {label = 'DEL', type = 'del'}
 	keys[#keys + 1] = {label = 'CLR', type = 'clear'}
@@ -469,17 +503,22 @@ function start.f_doKbKey(k)
 end
 
 --Navigate the on-screen keyboard and return false if search was closed
-function start.f_updateOnScreenKeyboard(cmd)
+function start.f_updateOnScreenKeyboard(cmd, typing)
 	if not selectplus.OnScreenKeyboard.enabled then return true end
 	local kb   = selectplus.OnScreenKeyboard
 	local cols = kb.cols
 	local n    = #kb.keys
-	local up  = rising(cmd, motif.select_info.cell.up.key)    or keyRising('UP')
-	local dn  = rising(cmd, motif.select_info.cell.down.key)  or keyRising('DOWN')
-	local lf  = rising(cmd, motif.select_info.cell.left.key)  or keyRising('LEFT')
-	local rt  = rising(cmd, motif.select_info.cell.right.key) or keyRising('RIGHT')
-	local btnA = rising(cmd, 'a') or keyRising('RETURN')   -- A button or Enter
-	local btnB = rising(cmd, 'b')
+	--Navigation uses a single rising-edge source because reading both getInput and getKey double-fires one press.
+	local up = rising(cmd, motif.select_info.cell.up.key)
+	local dn = rising(cmd, motif.select_info.cell.down.key)
+	local lf = rising(cmd, motif.select_info.cell.left.key)
+	local rt = rising(cmd, motif.select_info.cell.right.key)
+	--Always read a/b to keep their latches fresh but ignore them while typing, since some letter keys map to the a/b buttons.
+	--RETURN is deliberately unused here because it is engine-bound and grabbing it caused stray input and a close/reopen race.
+	local aPressed = rising(cmd, 'a')
+	local bPressed = rising(cmd, 'b')
+	local btnA = aPressed and not typing
+	local btnB = bPressed and not typing
 	if rising(cmd, kb.openButton) then
 		start.f_searchClose(false)
 		return false
@@ -529,7 +568,9 @@ function start.f_drawOnScreenKeyboard()
 	--Use active2 because it has a distinct color in every screenpack
 	local tdSel  = (stage ~= nil and stage.active2 ~= nil) and stage.active2.TextSpriteData or tdNorm
 
-	local nChar = #kb.keys - 4   
+	--Last 5 keys (@ SPC DEL CLR OK) render on the action row so '@' doesn't add a 7th grid row
+	local nAction = 5
+	local nChar = #kb.keys - nAction
 	for i = 1, nChar do
 		local col0 = (i - 1) % cols
 		local row0 = math.floor((i - 1) / cols)
@@ -539,9 +580,9 @@ function start.f_drawOnScreenKeyboard()
 	end
 	local actionY = kb.y0 + math.ceil(nChar / cols) * kb.cellH
 	local panelW  = (cols - 1) * kb.cellW
-	for a = 1, 4 do
+	for a = 1, nAction do
 		local idx = nChar + a
-		local x   = kb.x0 + ((a - 1) / 3) * panelW
+		local x   = kb.x0 + ((a - 1) / (nAction - 1)) * panelW
 		drawText(kb.keys[idx].label, x, actionY, (idx == start.kbIndex) and tdSel or tdNorm)
 	end
 end
@@ -571,7 +612,25 @@ function start.f_updateSearch()
 	end
 
 
-	if start.f_updateOnScreenKeyboard(cmd) == false then return end
+	--Read this frame's keyboard input first so the on-screen keyboard can ignore letter keys that double as a/b buttons.
+	local hwBackspace, typedText = false, ''
+	if getKey ~= nil then
+		if getKey('BACKSPACE') then
+			hwBackspace = true
+		elseif getKeyText ~= nil then
+			--strip control chars (Enter/Tab/etc.) so they can't pollute the query
+			typedText = (getKeyText() or ''):gsub('%c', '')
+		end
+	end
+	--Hold a short cooldown after each keystroke to suppress the on-screen keyboard's a/b actions, covering the frame lag before an aliased button registers.
+	if hwBackspace or (typedText ~= '') then
+		start.kbTypeGuard = 8
+	elseif start.kbTypeGuard > 0 then
+		start.kbTypeGuard = start.kbTypeGuard - 1
+	end
+	local suppressBtns = start.kbTypeGuard > 0
+
+	if start.f_updateOnScreenKeyboard(cmd, suppressBtns) == false then return end
 
 	if getKey == nil then return end
 	if esc ~= nil and esc() then
@@ -581,21 +640,19 @@ function start.f_updateSearch()
 		return
 	end
 	local changed = false
+	--F3 closes the search and keeps the filter so the snapped match stays for selection.
 	if keyRising(selectplus.Search.openKey) then
 		start.f_searchClose(false)
 		if resetKey ~= nil then resetKey() end
 		return
-	elseif getKey('BACKSPACE') then
+	elseif hwBackspace then
 		if #start.searchQuery > 0 then
 			start.searchQuery = start.searchQuery:sub(1, -2)
 			changed = true
 		end
-	else
-		local typed = getKeyText ~= nil and getKeyText() or ''
-		if typed ~= nil and typed ~= '' then
-			start.searchQuery = start.searchQuery .. typed
-			changed = true
-		end
+	elseif typedText ~= '' then
+		start.searchQuery = start.searchQuery .. typedText
+		changed = true
 	end
 	if resetKey ~= nil then resetKey() end
 	if changed then
@@ -637,16 +694,26 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 		--Draw the search query result count and on-screen keyboard
 		local sr = selectplus.Search
 		local n  = start.rosterFilter and #start.rosterFilter or 0
-		drawText('SEARCH: ' .. start.searchQuery:upper() .. '_', sr.textX, sr.textY)
-		drawText(n .. ' FOUND',                                   sr.textX, sr.countY)
+		--A leading '@' switches the readout label to author mode and hides the '@' itself
+		local q, label = start.searchQuery, 'SEARCH: '
+		if q:sub(1, 1) == '@' then q, label = q:sub(2), 'SEARCH AUTHOR: ' end
+		drawText(label .. q:upper() .. '_', sr.textX, sr.textY)
+		drawText(n .. ' FOUND',             sr.textX, sr.countY)
 		start.f_drawOnScreenKeyboard()
 	elseif selectplus.PageScrolling.enabled then
 		--Draw the page and size readout in the band under the mode title
 		local rp = start.rosterPage
 		local ir = selectplus.IconResize
 		local y  = selectplus.PageScrolling.readoutY
+		--Keep the active filter visible after the keyboard closes so it is clear what the grid is limited to
+		local tail = 'F3=SEARCH'
+		if start.rosterFilter ~= nil and start.searchQuery ~= '' then
+			local q = start.searchQuery
+			if q:sub(1, 1) == '@' then tail = 'AUTHOR: ' .. q:sub(2):upper()
+			else tail = 'FILTER: ' .. q:upper() end
+		end
 		drawText('PAGE ' .. rp.current .. '/' .. rp.total
-			.. '   ' .. start.f_rosterCount() .. ' CHARS   F3=SEARCH', nil, y)
+			.. '   ' .. start.f_rosterCount() .. ' CHARS   ' .. tail, nil, y)
 		if ir.enabled then
 			drawText('SIZE ' .. string.format('%.0f%%', ir.scale * 100)
 				.. '   F5/F6  /  L1+L2', nil, y + 36)
