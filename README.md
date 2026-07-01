@@ -15,3 +15,32 @@ Keys should say on screen what they are for keyboard
 Search - F3/Controller Start button
 Tile size - F5/F6 Controller L1+L2
 Paging - Next page L1 Prev Page L2 - Pressing right on last char in grid moves to next page, pressing left on first char on grid moves to prev page.
+
+Additional searching - 
+Search for character autheor using @author-name 
+Search for tag using #sptag (the sptag you assigned see below)
+
+Tag searching - requires adding either a the tag "sptag" to select.def or adding a file to the base game directory (same directory as the exe) named selectplus_tags.txt. If using
+selectplus_tags.txt the format is somewhat more simple.
+
+select.def format:
+Spiderman, stages/kfm.def, sptag = marvel
+
+selectplus_tags.txt -
+[dbz]
+Goku-SSJ2
+GokuSSJ3
+Goku-Super4
+GokuTerror
+
+[sf]
+Gouken
+ken1
+ken3rd
+Kenny
+
+[xmen]
+wolverine
+
+; explicit 'folder = tags' form (multiple tags split by | ):
+ronald = fastfood|clown
