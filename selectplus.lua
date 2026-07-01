@@ -1,11 +1,25 @@
 --=============================================================================
---selectplus.lua 
+--selectplus.lua  -  Copyright (c) 2026 scristopher
 --=============================================================================
---Drop this file in  external/mods/ 
+--Drop this file in  external/mods/
+--=============================================================================
+--TERMS OF USE
+--Free to use as-is in any FREE build, roster, or collection. No credit is
+--required for normal use, and you may redistribute the UNMODIFIED file freely.
+--
+--This mod must remain free. You may NOT sell it, charge money for it, place it
+--behind a paywall, or include it in any paid or commercial product.
+--
+--If you MODIFY this file, or reuse any part of its code in another work, you
+--must give clear, visible credit to the original author
+--(scristopher, https://github.com/scristopher/Ikemen-selectplus) and must not
+--present the work as your own.
+--
+--This notice must remain intact in the source file.
 --=============================================================================
 
 local selectplus = {}
-selectplus.version = '0.10.1-filterhud'
+selectplus.version = '0.11.1-tagfile'
 
 --=============================================================================
 -- CONFIGURATION  edit this section to customise
@@ -31,6 +45,23 @@ selectplus.Search = {
     textX   = 610,    -- x for the "SEARCH: QUERY_"
     textY   = 632,    -- y for the "SEARCH: QUERY_"
     countY  = 662,    -- y for the "N FOUND"
+}
+
+--TAG / CATEGORY SEARCH
+--A leading '#' in the search filters by character tag (e.g. '#sf' shows chars
+--tagged sf). Tags are read from a namespaced select.def param, default 'sptag'
+--(e.g. 'Ryu, stages/sf.def, sptag = sf|capcom'; multiple tags separated by '|').
+--A separate-file tag source is planned; for now tags are read inline.
+selectplus.Tags = {
+    enabled     = true,
+    inlineParam = 'sptag',   -- select.def param, read in Lua as cd.<inlineParam>
+    multiSep    = '|',       -- separator for multiple tags in one value
+    --OPTIONAL tag file (folder-keyed), merged with inline tags. Leave the file
+    --absent to ignore it entirely; only inline sptag= is used then. Formats:
+    --  [sf]              <- section header sets the tag
+    --  ryu               <- folder 'ryu' gets tag 'sf'
+    --  morrigan = ds|cap <- explicit 'folder = tag|tag' (works in or out of a section)
+    file        = 'selectplus_tags.txt',
 }
 
 --ON-SCREEN KEYBOARD
@@ -107,6 +138,7 @@ start.rosterPage = start.rosterPage or {current = 1, pageSize = 0, total = 1}
 start.rosterFilter    = nil
 start.rosterNameCache = nil
 start.rosterAuthorCache = nil
+start.rosterTagCache  = nil
 start.searchMode      = false
 start.searchQuery     = ''
 start.searchCloseGuard = 0
@@ -204,11 +236,48 @@ end
 --------------------------------------------------------------------------------
 --SEARCH
 --------------------------------------------------------------------------------
---Build lowercase name and author indexes keyed to roster position (author comes free from getCharInfo)
+--Load the OPTIONAL tag file into a folder->tags map. Missing/disabled file returns
+--an empty map (inline tags only). Supports [tag] sections + 'folder = tag|tag' lines.
+function start.f_loadTagFile()
+	local cfg = selectplus.Tags
+	local map = {}
+	if cfg == nil or not cfg.enabled or cfg.file == nil or cfg.file == '' or io == nil then
+		return map
+	end
+	local f = io.open(cfg.file, 'r')
+	if f == nil then return map end   --file absent = optional, just skip
+	local sep = cfg.multiSep or '|'
+	local section = nil
+	local function addTag(folder, tag)
+		folder = folder:lower()
+		map[folder] = (map[folder] ~= nil and (map[folder] .. sep) or '') .. tag:lower()
+	end
+	for line in f:lines() do
+		line = line:gsub('^%s+', ''):gsub('%s+$', '')
+		if line ~= '' and line:sub(1, 1) ~= ';' then
+			local sec = line:match('^%[%s*(.-)%s*%]$')
+			local folder, tags = line:match('^(.-)%s*=%s*(.+)$')
+			if sec ~= nil then
+				section = sec
+			elseif folder ~= nil and folder ~= '' then
+				addTag(folder, tags)                  --explicit 'folder = tags'
+			elseif section ~= nil then
+				addTag(line, section)                 --bare folder under a [section]
+			end
+		end
+	end
+	f:close()
+	return map
+end
+
+--Build lowercase name/author/tag indexes keyed to roster position (author comes free from getCharInfo)
 function start.f_buildNameCache()
-	local nameCache, authorCache = {}, {}
+	local nameCache, authorCache, tagCache = {}, {}, {}
+	local tagParam = (selectplus.Tags and selectplus.Tags.inlineParam) or 'sptag'
+	local sep      = (selectplus.Tags and selectplus.Tags.multiSep) or '|'
+	local fileMap  = start.f_loadTagFile()
 	for i = 1, #main.t_selGrid do
-		local nm, au = '', ''
+		local nm, au, tg = '', '', ''
 		local gc = main.t_selGrid[i]
 		if gc ~= nil and gc.chars ~= nil and #gc.chars > 0 then
 			local cd = main.t_selChars[gc.chars[gc.slot or 1]]
@@ -216,13 +285,24 @@ function start.f_buildNameCache()
 			if cd ~= nil and cd.name ~= nil and cd.hidden ~= 2 and cd.exclude ~= 1 and cd.bonus ~= 1 then
 				nm = cd.name:lower()
 				au = (cd.author or ''):lower()
+				--Tags = the inline select.def param (cd.<sptag>) UNION the optional tag file,
+				--matched by folder name. Kept raw with the separator so a substring match
+				--can't bleed across two tags.
+				local inlineTags = tostring(cd[tagParam] or ''):lower()
+				local folder     = ((cd.def or ''):match('([^/\\]+)[/\\][^/\\]+%.[Dd][Ee][Ff]$') or ''):lower()
+				local fileTags   = fileMap[folder] or ''
+				if fileTags ~= '' and inlineTags ~= '' then tg = fileTags .. sep .. inlineTags
+				elseif fileTags ~= '' then tg = fileTags
+				else tg = inlineTags end
 			end
 		end
 		nameCache[i]   = nm
 		authorCache[i] = au
+		tagCache[i]    = tg
 	end
 	start.rosterNameCache   = nameCache
 	start.rosterAuthorCache = authorCache
+	start.rosterTagCache    = tagCache
 end
 
 --Apply a search filter, where nil clears it and an empty query matches nothing.
@@ -234,9 +314,16 @@ function start.f_applyFilter(query)
 		return
 	end
 	if start.rosterNameCache == nil then start.f_buildNameCache() end
-	local authorMode = query:sub(1, 1) == '@'
-	local cache = authorMode and start.rosterAuthorCache or start.rosterNameCache
-	local q = (authorMode and query:sub(2) or query):lower()
+	--'@' searches author, '#' searches tags, anything else searches the name.
+	local prefix = query:sub(1, 1)
+	local cache, q
+	if prefix == '@' then
+		cache, q = start.rosterAuthorCache, query:sub(2):lower()
+	elseif prefix == '#' then
+		cache, q = start.rosterTagCache, query:sub(2):lower()
+	else
+		cache, q = start.rosterNameCache, query:lower()
+	end
 	if q == '' then
 		start.rosterFilter = {}
 		start.f_finishFilter()
@@ -471,6 +558,7 @@ do
 		keys[#keys + 1] = {label = c, type = 'char', ch = c:lower()}
 	end
 	keys[#keys + 1] = {label = '@', type = 'char', ch = '@'}   --leading '@' switches to author search
+	keys[#keys + 1] = {label = '#', type = 'char', ch = '#'}   --leading '#' switches to tag search
 	keys[#keys + 1] = {label = 'SPC', type = 'space'}
 	keys[#keys + 1] = {label = 'DEL', type = 'del'}
 	keys[#keys + 1] = {label = 'CLR', type = 'clear'}
@@ -568,8 +656,8 @@ function start.f_drawOnScreenKeyboard()
 	--Use active2 because it has a distinct color in every screenpack
 	local tdSel  = (stage ~= nil and stage.active2 ~= nil) and stage.active2.TextSpriteData or tdNorm
 
-	--Last 5 keys (@ SPC DEL CLR OK) render on the action row so '@' doesn't add a 7th grid row
-	local nAction = 5
+	--Last 6 keys (@ # SPC DEL CLR OK) render on the action row so they don't add extra grid rows
+	local nAction = 6
 	local nChar = #kb.keys - nAction
 	for i = 1, nChar do
 		local col0 = (i - 1) % cols
@@ -694,9 +782,11 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 		--Draw the search query result count and on-screen keyboard
 		local sr = selectplus.Search
 		local n  = start.rosterFilter and #start.rosterFilter or 0
-		--A leading '@' switches the readout label to author mode and hides the '@' itself
+		--A leading '@'/'#' switches the readout label to author/tag mode and hides the prefix
 		local q, label = start.searchQuery, 'SEARCH: '
-		if q:sub(1, 1) == '@' then q, label = q:sub(2), 'SEARCH AUTHOR: ' end
+		local pfx = q:sub(1, 1)
+		if     pfx == '@' then q, label = q:sub(2), 'SEARCH AUTHOR: '
+		elseif pfx == '#' then q, label = q:sub(2), 'SEARCH TAG: ' end
 		drawText(label .. q:upper() .. '_', sr.textX, sr.textY)
 		drawText(n .. ' FOUND',             sr.textX, sr.countY)
 		start.f_drawOnScreenKeyboard()
@@ -709,7 +799,9 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 		local tail = 'F3=SEARCH'
 		if start.rosterFilter ~= nil and start.searchQuery ~= '' then
 			local q = start.searchQuery
-			if q:sub(1, 1) == '@' then tail = 'AUTHOR: ' .. q:sub(2):upper()
+			local pfx = q:sub(1, 1)
+			if     pfx == '@' then tail = 'AUTHOR: ' .. q:sub(2):upper()
+			elseif pfx == '#' then tail = 'TAG: ' .. q:sub(2):upper()
 			else tail = 'FILTER: ' .. q:upper() end
 		end
 		drawText('PAGE ' .. rp.current .. '/' .. rp.total
