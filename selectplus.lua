@@ -19,7 +19,7 @@
 --=============================================================================
 
 local selectplus = {}
-selectplus.version = '0.11.1-tagfile'
+selectplus.version = '0.11.2-guards'
 
 --=============================================================================
 -- CONFIGURATION  edit this section to customise
@@ -49,9 +49,9 @@ selectplus.Search = {
 
 --TAG / CATEGORY SEARCH
 --A leading '#' in the search filters by character tag (e.g. '#sf' shows chars
---tagged sf). Tags are read from a namespaced select.def param, default 'sptag'
---(e.g. 'Ryu, stages/sf.def, sptag = sf|capcom'; multiple tags separated by '|').
---A separate-file tag source is planned; for now tags are read inline.
+--tagged sf). Tags come from two sources, merged: a namespaced select.def param
+--(default 'sptag', e.g. 'Ryu, stages/sf.def, sptag = sf|capcom') and an OPTIONAL
+--tag file (see 'file' below). Multiple tags in one value are separated by '|'.
 selectplus.Tags = {
     enabled     = true,
     inlineParam = 'sptag',   -- select.def param, read in Lua as cd.<inlineParam>
@@ -418,15 +418,16 @@ local function initIconResize()
 			if g then _irOrigGrid[row][col] = {x = g.x, y = g.y} end
 		end
 	end
-	local p  = motif.select_info.portrait
-	local cb = motif.select_info.cell.bg
-	local cr = motif.select_info.cell.random
-	local cs = motif.select_info.cell
+	--Guard every optional motif field so a screenpack that omits portrait/cell can't crash us.
+	local p  = motif.select_info.portrait or {}
+	local cs = motif.select_info.cell or {}
+	local cb = cs.bg or {}
+	local cr = cs.random or {}
 	_irOrigPortraitSc  = p.scale  and {p.scale[1],  p.scale[2]}  or {1, 1}
 	_irOrigPortraitOff = p.offset and {p.offset[1], p.offset[2]} or {0, 0}
-	_irOrigBgSc        = cb and cb.scale and {cb.scale[1], cb.scale[2]} or {1, 1}
-	_irOrigRandomSc    = cr and cr.scale and {cr.scale[1], cr.scale[2]} or {1, 1}
-	_irOrigCellSize    = cs.size and {cs.size[1], cs.size[2]} or {24, 24}
+	_irOrigBgSc        = cb.scale and {cb.scale[1], cb.scale[2]} or {1, 1}
+	_irOrigRandomSc    = cr.scale and {cr.scale[1], cr.scale[2]} or {1, 1}
+	_irOrigCellSize    = cs.size  and {cs.size[1],  cs.size[2]}  or {24, 24}
 	_irInit = true
 end
 
@@ -451,19 +452,19 @@ local function applyIconResize(s)
 		end
 	end
 
-	--Scale the portrait sprite
+	--Scale the portrait sprite (guarded: some motifs omit portrait)
 	local p = motif.select_info.portrait
-	p.scale  = {_irOrigPortraitSc[1]  * s, _irOrigPortraitSc[2]  * s}
-	p.offset = {_irOrigPortraitOff[1] * s, _irOrigPortraitOff[2] * s}
+	if p then
+		p.scale  = {_irOrigPortraitSc[1]  * s, _irOrigPortraitSc[2]  * s}
+		p.offset = {_irOrigPortraitOff[1] * s, _irOrigPortraitOff[2] * s}
+	end
 
-	--Scale the cell background
-	local cb = motif.select_info.cell.bg
+	--Scale the cell background / size (guarded: some motifs omit cell.*)
+	local cs = motif.select_info.cell or {}
+	local cb = cs.bg
 	if cb then cb.scale = {_irOrigBgSc[1] * s, _irOrigBgSc[2] * s} end
-	local cr = motif.select_info.cell.random
+	local cr = cs.random
 	if cr then cr.scale = {_irOrigRandomSc[1] * s, _irOrigRandomSc[2] * s} end
-
-	--Scale cell.size
-	local cs = motif.select_info.cell
 	if cs.size then cs.size = {_irOrigCellSize[1] * s, _irOrigCellSize[2] * s} end
 
 	start.needUpdateDrawList = true
@@ -602,7 +603,7 @@ function start.f_updateOnScreenKeyboard(cmd, typing)
 	local lf = rising(cmd, motif.select_info.cell.left.key)
 	local rt = rising(cmd, motif.select_info.cell.right.key)
 	--Always read a/b to keep their latches fresh but ignore them while typing, since some letter keys map to the a/b buttons.
-	--RETURN is deliberately unused here because it is engine-bound and grabbing it caused stray input and a close/reopen race.
+	--RETURN is deliberately unused here 
 	local aPressed = rising(cmd, 'a')
 	local bPressed = rising(cmd, 'b')
 	local btnA = aPressed and not typing
