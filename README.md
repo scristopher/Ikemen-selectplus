@@ -1,12 +1,3 @@
-Note: written in plain formatting, not BBCode - MFFA's editor is likely a
-WYSIWYG (XenForo-style), so paste this in and apply bold/lists/headers with
-the editor's toolbar rather than typing raw tags. Adjust as needed for
-however posting actually works there.
-
----
-
-# selectplus - Character Select Enhancements for IKEMEN GO
-
 **TL;DR:** Drop one `.lua` file into `external/mods/` and character select
 gets paging, live search (by name/author/tag), and on-the-fly tile
 resizing. No engine edits, no bundled assets, no screenpack rebuild.
