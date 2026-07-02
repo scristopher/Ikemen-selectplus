@@ -19,7 +19,7 @@
 --=============================================================================
 
 local selectplus = {}
-selectplus.version = '0.11.2-guards'
+selectplus.version = '0.12-rc1'
 
 --=============================================================================
 -- CONFIGURATION  edit this section to customise
@@ -34,7 +34,6 @@ selectplus.PageScrolling = {
     keyboard   = { prev = 'PAGEUP', next = 'PAGEDOWN' },  -- keyboard PGUP/PGDN
     edgePaging = true,  -- push RIGHT off the last cell -> next page; LEFT off the
                         -- first cell -> previous page. Corners are read from the motif (columns/rows)
-    readoutY   = 110,   -- for the PAGE N/N info line
 }
 
 --SEARCH
@@ -42,9 +41,6 @@ selectplus.PageScrolling = {
 selectplus.Search = {
     enabled = true,
     openKey = 'F3',   -- keyboard key to open / close search
-    textX   = 610,    -- x for the "SEARCH: QUERY_"
-    textY   = 632,    -- y for the "SEARCH: QUERY_"
-    countY  = 662,    -- y for the "N FOUND"
 }
 
 --TAG / CATEGORY SEARCH
@@ -89,6 +85,54 @@ selectplus.IconResize = {
     controllerCombo = true,     -- L1+L2 cycles size set false to disable
 }
 
+--STYLE / THEMING
+--Per-element control of the on-screen text: show/hide, position, font, bank,
+--alignment, scale, and color.
+--  show  : draw this element or not
+--  x/y   : localcoord position (x = nil keeps the motif's text base x)
+--  font  : '' = the motif's stage font; or a font file
+--          (e.g. 'font/mine.def') loaded just for this element
+--  bank  : palette bank for bitmap/SFF fonts
+--  align : -1 left, 0 center, 1 right
+--  scale : {x,y} text scale for custom fonts
+--  color : {r,g,b} 0-255, applied ONLY to a custom font. Leave it out for bitmap/SFF
+--          fonts (they keep their built-in colors). TrueType fonts have no color of
+--          their own and render INVISIBLE without one, so give TTF elements a color.
+--The keyboard element additionally supports a 'keys' table (per-letter overrides,
+--keyed by label) and 'evenKeyStyle' (a fallback for keys at an even grid position);
+--see the commented example below.
+selectplus.Style = {
+    --Defaults to the motif's own stage font (font = '') so this stays a single-file
+    --drop-in with no bundled font assets. Point font at a screenpack-provided .def
+    --(e.g. 'font/mine.def') to borrow a different look for one element.
+    pageReadout  = { show = true, x = nil, y = 110, font = '' }, -- "PAGE 1/1  N CHARS  F3=SEARCH"
+    sizeReadout  = { show = true, x = nil, y = 146, font = '' }, -- "SIZE 100%  F5/F6 / L1+L2"
+    searchPrompt = { show = true, x = 610, y = 632, font = '' }, -- "SEARCH: query_"
+    foundCount   = { show = true, x = 610, y = 662, font = '' }, -- "N FOUND"
+    --EXAMPLE (whole keyboard): font = 'font/mine.def', selFont = 'font/mine.def', bank = 1,
+    --selBank = 2, color = {255,255,255}, selColor = {192,255,192} would give every key a
+    --shared custom font, with the selected key in a different color so it stands out.
+    keyboard     = { font = '', selFont = '', bank = nil, selBank = nil, align = 0, scale = nil, color = nil, selColor = nil,
+        --EXAMPLE (individual letters): a key's own entry in 'keys' always wins; 'evenKeyStyle'
+        --is a fallback for keys at an even grid position (2nd, 4th, ...) with no entry of
+        --their own; anything left over falls back to the shared font/color/bank above.
+        --keys = {
+        --    A = { font = 'font/mine.def', bank = 1, color = {255,255,255} },
+        --    B = { font = 'font/mine.def', bank = 2, color = {255,120,120} },
+        --},
+        --evenKeyStyle = { font = 'font/mine.def', bank = 1, scale = {0.9, 0.9} },
+    }, -- on-screen keyboard labels
+}
+
+--EXAMPLE: borrow a bitmap/SFF font from your screenpack for the page readout only,
+--leaving every other element on the motif's own stage font. Bitmap fonts need 'bank'
+--(their palette bank), not 'color' (they already have baked-in colors).
+--selectplus.Style.pageReadout = { show = true, x = nil, y = 110, font = 'font/mine.def', bank = 1, scale = {0.7, 0.7} }
+
+--EXAMPLE: use a TrueType font for the search prompt. TrueType fonts have no built-in
+--color, so give them one explicitly or they render invisible.
+--selectplus.Style.searchPrompt = { show = true, x = 610, y = 632, font = 'font/mine-tt.def', color = {255,255,255}, scale = {0.85, 0.85} }
+
 --=============================================================================
 --END OF CONFIGURATION
 --=============================================================================
@@ -100,18 +144,70 @@ local function p1cmd()
 end
 
 --Draw a string with the motif's stage font at an absolute localcoord
+--Absolute positioning, not relative to the reused sprite's baked-in motif offset: some
+--screenpacks set stage.active.offset far off their visible canvas (they don't use the
+--engine's built-in per-cell active/done label), which a relative textImgAddPos would
+--inherit and render invisibly. x/y here are always literal localcoord coordinates.
 local function drawText(text, x, y, td)
 	local si = motif and motif.select_info
 	if si == nil or si.stage == nil or si.stage.active == nil then return end
 	td = td or si.stage.active.TextSpriteData
 	if td == nil then return end
-	local bx, by = 160, 220
-	if si.stage.pos ~= nil then bx, by = si.stage.pos[1], si.stage.pos[2] end
+	local bx = (si.stage.pos ~= nil) and si.stage.pos[1] or 160
 	textImgReset(td)
 	if textImgSetAlign ~= nil then textImgSetAlign(td, 0) end
-	textImgAddPos(td, (x ~= nil and (x - bx) or 0), y - by)
+	if textImgSetPos ~= nil then textImgSetPos(td, x or bx, y) end
 	textImgSetText(td, text)
 	textImgDraw(td)
+end
+
+--Load a custom font file once (via fontNew) into a reusable text sprite. Result is
+--cached per path; a failed load is cached as false so we don't retry every frame.
+local _customFontCache = {}
+local function f_customFont(spec)
+	if spec == nil or spec == '' then return nil end
+	if _customFontCache[spec] ~= nil then return _customFontCache[spec] or nil end
+	local ts = false
+	if fontNew ~= nil and textImgNew ~= nil and textImgSetFont ~= nil then
+		local fnt = fontNew(spec)
+		if fnt ~= nil then
+			ts = textImgNew()
+			textImgSetFont(ts, fnt)
+		end
+	end
+	_customFontCache[spec] = ts
+	return ts or nil
+end
+
+--Draw a string honouring a per-element font. '' uses the motif's stage font (drawText);
+--a font file is loaded once and drawn at the absolute position (textImgSetPos). color is
+--a {r,g,b[,a]} table applied only when set: bitmap/SFF fonts keep their baked colors when
+--color is nil, but TrueType fonts have NO color of their own and render invisibly without one.
+local function drawStyledText(text, x, y, fontSpec, color, bank, align, scale)
+	if fontSpec == nil or fontSpec == '' then
+		drawText(text, x, y)
+		return
+	end
+	local ts = f_customFont(fontSpec)
+	if ts == nil then drawText(text, x, y); return end   --load failed -> fall back to motif font
+	local si = motif and motif.select_info
+	local px = x
+	if px == nil then px = (si and si.stage and si.stage.pos and si.stage.pos[1]) or 160 end
+	textImgReset(ts)
+	if textImgSetLocalcoord ~= nil and motif ~= nil and motif.info ~= nil and motif.info.localcoord ~= nil then
+		textImgSetLocalcoord(ts, motif.info.localcoord[1], motif.info.localcoord[2])
+	end
+	if textImgSetAlign ~= nil then textImgSetAlign(ts, align or 0) end
+	if bank ~= nil and textImgSetBank ~= nil then textImgSetBank(ts, bank) end
+	if type(scale) == 'table' and textImgSetScale ~= nil then
+		textImgSetScale(ts, scale[1] or 1, scale[2] or scale[1] or 1)
+	end
+	if type(color) == 'table' and textImgSetColor ~= nil then
+		textImgSetColor(ts, color[1] or 255, color[2] or 255, color[3] or 255, color[4] or 255)
+	end
+	textImgSetText(ts, text)
+	if textImgSetPos ~= nil then textImgSetPos(ts, px, y) end
+	textImgDraw(ts)
 end
 
 local spHeld = {}
@@ -281,8 +377,10 @@ function start.f_buildNameCache()
 		local gc = main.t_selGrid[i]
 		if gc ~= nil and gc.chars ~= nil and #gc.chars > 0 then
 			local cd = main.t_selChars[gc.chars[gc.slot or 1]]
-			--Skip characters a user has hidden from the grid so they don't appear in search results
-			if cd ~= nil and cd.name ~= nil and cd.hidden ~= 2 and cd.exclude ~= 1 and cd.bonus ~= 1 then
+			--Skip characters a user has hidden from the grid so they don't appear in search results.
+			--boss is not a real select.def param (engine never sets it, so this check is a harmless no-op)
+			--but is kept here since some users expect it to exist.
+			if cd ~= nil and cd.name ~= nil and cd.hidden ~= 2 and cd.exclude ~= 1 and cd.bonus ~= 1 and cd.boss ~= 1 then
 				nm = cd.name:lower()
 				au = (cd.author or ''):lower()
 				--Tags = the inline select.def param (cd.<sptag>) UNION the optional tag file,
@@ -651,11 +749,38 @@ function start.f_drawOnScreenKeyboard()
 	if not start.searchMode then return end
 	start.f_drawKbBackdrop()
 	local kb    = selectplus.OnScreenKeyboard
+	local ks    = selectplus.Style.keyboard or {}
 	local cols  = kb.cols
 	local stage = motif.select_info.stage
 	local tdNorm = (stage ~= nil and stage.active  ~= nil) and stage.active.TextSpriteData  or nil
 	--Use active2 because it has a distinct color in every screenpack
 	local tdSel  = (stage ~= nil and stage.active2 ~= nil) and stage.active2.TextSpriteData or tdNorm
+
+	--A per-key entry in ks.keys[label] always wins; evenKeyStyle falls back for keys at
+	--an even grid position that have no entry of their own; otherwise use the shared style.
+	local function drawKeyLabel(label, x, y, selected, keyIndex)
+		local override = nil
+		if type(ks.keys) == 'table' then override = ks.keys[label] end
+		if override == nil and type(ks.evenKeyStyle) == 'table' and keyIndex % 2 == 0 then
+			override = ks.evenKeyStyle
+		end
+		override = override or {}
+
+		local baseFont = selected and (ks.selFont ~= nil and ks.selFont ~= '' and ks.selFont or ks.font) or ks.font
+		local font = selected and (override.selFont ~= nil and override.selFont ~= '' and override.selFont or override.font or baseFont)
+			or (override.font or baseFont)
+		local color = selected and (override.selColor or override.color or ks.selColor or ks.color)
+			or (override.color or ks.color)
+		local bank = selected and (override.selBank or override.bank or ks.selBank or ks.bank)
+			or (override.bank or ks.bank)
+		local align = override.align or ks.align
+		local scale = override.scale or ks.scale
+		if font ~= nil and font ~= '' then
+			drawStyledText(label, x, y, font, color, bank, align, scale)
+		else
+			drawText(label, x, y, selected and tdSel or tdNorm)
+		end
+	end
 
 	--Last 6 keys (@ # SPC DEL CLR OK) render on the action row so they don't add extra grid rows
 	local nAction = 6
@@ -665,14 +790,14 @@ function start.f_drawOnScreenKeyboard()
 		local row0 = math.floor((i - 1) / cols)
 		local x    = kb.x0 + col0 * kb.cellW
 		local y    = kb.y0 + row0 * kb.cellH
-		drawText(kb.keys[i].label, x, y, (i == start.kbIndex) and tdSel or tdNorm)
+		drawKeyLabel(kb.keys[i].label, x, y, i == start.kbIndex, i)
 	end
 	local actionY = kb.y0 + math.ceil(nChar / cols) * kb.cellH
 	local panelW  = (cols - 1) * kb.cellW
 	for a = 1, nAction do
 		local idx = nChar + a
 		local x   = kb.x0 + ((a - 1) / (nAction - 1)) * panelW
-		drawText(kb.keys[idx].label, x, actionY, (idx == start.kbIndex) and tdSel or tdNorm)
+		drawKeyLabel(kb.keys[idx].label, x, actionY, idx == start.kbIndex, idx)
 	end
 end
 
@@ -780,22 +905,22 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 
 	--Draw the overlay
 	if start.searchMode then
-		--Draw the search query result count and on-screen keyboard
-		local sr = selectplus.Search
+		--Draw the search prompt, result count, and on-screen keyboard
+		local st = selectplus.Style
 		local n  = start.rosterFilter and #start.rosterFilter or 0
 		--A leading '@'/'#' switches the readout label to author/tag mode and hides the prefix
 		local q, label = start.searchQuery, 'SEARCH: '
 		local pfx = q:sub(1, 1)
 		if     pfx == '@' then q, label = q:sub(2), 'SEARCH AUTHOR: '
 		elseif pfx == '#' then q, label = q:sub(2), 'SEARCH TAG: ' end
-		drawText(label .. q:upper() .. '_', sr.textX, sr.textY)
-		drawText(n .. ' FOUND',             sr.textX, sr.countY)
+		if st.searchPrompt.show then drawStyledText(label .. q:upper() .. '_', st.searchPrompt.x, st.searchPrompt.y, st.searchPrompt.font, st.searchPrompt.color, st.searchPrompt.bank, st.searchPrompt.align, st.searchPrompt.scale) end
+		if st.foundCount.show   then drawStyledText(n .. ' FOUND',             st.foundCount.x,   st.foundCount.y,   st.foundCount.font, st.foundCount.color, st.foundCount.bank, st.foundCount.align, st.foundCount.scale) end
 		start.f_drawOnScreenKeyboard()
 	elseif selectplus.PageScrolling.enabled then
 		--Draw the page and size readout in the band under the mode title
 		local rp = start.rosterPage
 		local ir = selectplus.IconResize
-		local y  = selectplus.PageScrolling.readoutY
+		local st = selectplus.Style
 		--Keep the active filter visible after the keyboard closes so it is clear what the grid is limited to
 		local tail = 'F3=SEARCH'
 		if start.rosterFilter ~= nil and start.searchQuery ~= '' then
@@ -805,11 +930,13 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 			elseif pfx == '#' then tail = 'TAG: ' .. q:sub(2):upper()
 			else tail = 'FILTER: ' .. q:upper() end
 		end
-		drawText('PAGE ' .. rp.current .. '/' .. rp.total
-			.. '   ' .. start.f_rosterCount() .. ' CHARS   ' .. tail, nil, y)
-		if ir.enabled then
-			drawText('SIZE ' .. string.format('%.0f%%', ir.scale * 100)
-				.. '   F5/F6  /  L1+L2', nil, y + 36)
+		if st.pageReadout.show then
+			drawStyledText('PAGE ' .. rp.current .. '/' .. rp.total
+				.. '   ' .. start.f_rosterCount() .. ' CHARS   ' .. tail, st.pageReadout.x, st.pageReadout.y, st.pageReadout.font, st.pageReadout.color, st.pageReadout.bank, st.pageReadout.align, st.pageReadout.scale)
+		end
+		if ir.enabled and st.sizeReadout.show then
+			drawStyledText('SIZE ' .. string.format('%.0f%%', ir.scale * 100)
+				.. '   F5/F6  /  L1+L2', st.sizeReadout.x, st.sizeReadout.y, st.sizeReadout.font, st.sizeReadout.color, st.sizeReadout.bank, st.sizeReadout.align, st.sizeReadout.scale)
 		end
 	end
 end)
