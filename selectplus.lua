@@ -19,7 +19,7 @@
 --=============================================================================
 
 local selectplus = {}
-selectplus.version = '0.12-rc1'
+selectplus.version = '0.12-rc6'
 
 --=============================================================================
 -- CONFIGURATION  edit this section to customise
@@ -138,25 +138,36 @@ selectplus.Style = {
 --=============================================================================
 
 --------------------------------------------------------------------------------
---Read the global input id so getInput reads every mapped button reliably
+--Fallback cmd read by keyboard-only paths and used before any player-specific cmd is known.
+--Search itself prefers whichever player's cmd is still browsing (see f_updateSearch), so a
+--second player isn't stuck reading player 1's controller after player 1 locks in.
 local function p1cmd()
 	return -1
 end
 
---Draw a string with the motif's stage font at an absolute localcoord
---Absolute positioning, not relative to the reused sprite's baked-in motif offset: some
---screenpacks set stage.active.offset far off their visible canvas (they don't use the
---engine's built-in per-cell active/done label), which a relative textImgAddPos would
---inherit and render invisibly. x/y here are always literal localcoord coordinates.
-local function drawText(text, x, y, td)
+--Draw a string with the motif's stage font at an absolute localcoord. Uses textImgAddPos
+--(relative), never textImgSetPos, on this shared engine sprite: SetPos permanently
+--overwrites the sprite's own offsetInit as a side effect (confirmed in the engine source),
+--which would corrupt it for the engine's own later reuse of this same sprite -- the
+--stage-select screen's stage name reuses this exact object once character select ends, so
+--corrupting its baked position here made the stage name render in the wrong place there.
+--The relative delta is computed from the sprite's true resting position (its own configured
+--offset plus stage.pos) so this lands at the right spot regardless of what that offset is,
+--without ever touching offsetInit. 'el' is the motif element table (e.g. si.stage.active),
+--not a raw TextSprite -- it needs both .TextSpriteData and .offset.
+local function drawText(text, x, y, el)
 	local si = motif and motif.select_info
 	if si == nil or si.stage == nil or si.stage.active == nil then return end
-	td = td or si.stage.active.TextSpriteData
+	el = el or si.stage.active
+	local td = el.TextSpriteData
 	if td == nil then return end
-	local bx = (si.stage.pos ~= nil) and si.stage.pos[1] or 160
+	local restX, restY = 0, 0
+	if el.offset ~= nil then restX, restY = el.offset[1], el.offset[2] end
+	if si.stage.pos ~= nil then restX, restY = restX + si.stage.pos[1], restY + si.stage.pos[2] end
+	local targetX = x or restX
 	textImgReset(td)
 	if textImgSetAlign ~= nil then textImgSetAlign(td, 0) end
-	if textImgSetPos ~= nil then textImgSetPos(td, x or bx, y) end
+	if textImgAddPos ~= nil then textImgAddPos(td, targetX - restX, y - restY) end
 	textImgSetText(td, text)
 	textImgDraw(td)
 end
@@ -498,6 +509,7 @@ end
 --Capture the motif's original sizes once so every resize is computed from them without drift.
 local _irInit             = false
 local _ctrlHeld           = {}    --per-side latch for shoulder-button rising edges
+local _lastCmd            = {}    --per-side cmd, captured each frame so search can read whichever player is still browsing, not just p1
 local _irOrigGrid         = {}    --[row][col] = {x, y}
 local _irOrigPortraitSc   = nil   --portrait.scale  {x, y}  (default {1,1} if nil)
 local _irOrigPortraitOff  = nil   --portrait.offset {x, y}
@@ -602,6 +614,7 @@ end
 
 --Handle controller paging and icon resize
 function start.f_controllerSelectInput(side, cmd, player)
+	_lastCmd[side] = cmd  --the engine only calls this for players still picking, with their own real cmd
 	local ps = selectplus.PageScrolling
 	local ir = selectplus.IconResize
 	local prevHeld = ps.enabled and getInput(cmd, ps.controller.prev) and true or false  --L1 = 'd'
@@ -752,9 +765,9 @@ function start.f_drawOnScreenKeyboard()
 	local ks    = selectplus.Style.keyboard or {}
 	local cols  = kb.cols
 	local stage = motif.select_info.stage
-	local tdNorm = (stage ~= nil and stage.active  ~= nil) and stage.active.TextSpriteData  or nil
+	local elNorm = (stage ~= nil and stage.active  ~= nil) and stage.active  or nil
 	--Use active2 because it has a distinct color in every screenpack
-	local tdSel  = (stage ~= nil and stage.active2 ~= nil) and stage.active2.TextSpriteData or tdNorm
+	local elSel  = (stage ~= nil and stage.active2 ~= nil) and stage.active2 or elNorm
 
 	--A per-key entry in ks.keys[label] always wins; evenKeyStyle falls back for keys at
 	--an even grid position that have no entry of their own; otherwise use the shared style.
@@ -778,7 +791,7 @@ function start.f_drawOnScreenKeyboard()
 		if font ~= nil and font ~= '' then
 			drawStyledText(label, x, y, font, color, bank, align, scale)
 		else
-			drawText(label, x, y, selected and tdSel or tdNorm)
+			drawText(label, x, y, selected and elSel or elNorm)
 		end
 	end
 
@@ -805,10 +818,19 @@ end
 function start.f_updateSearch()
 	if not selectplus.Search.enabled then return end
 	if start.searchCloseGuard > 0 then start.searchCloseGuard = start.searchCloseGuard - 1 end
-	--only act while browsing the character grid.
-	local browsing = start.p ~= nil and start.p[1] ~= nil
-		and start.p[1].teamEnd and not start.p[1].selEnd
-	local cmd = p1cmd()
+	--Find a side that's still browsing (hasn't locked in a character yet). In 2-player mode
+	--this must not be hardcoded to side 1: once p1 locks in, p2 still needs to be able to
+	--open and drive search with their own controller, not be stuck reading p1's input.
+	local browseSide, cmd = nil, p1cmd()
+	for side = 1, 2 do
+		local ps = start.p and start.p[side]
+		if ps ~= nil and ps.teamEnd and not ps.selEnd then
+			browseSide = side
+			cmd = _lastCmd[side] or cmd
+			break
+		end
+	end
+	local browsing = browseSide ~= nil
 
 	if not start.searchMode then
 		local openCtrl = selectplus.OnScreenKeyboard.enabled
@@ -903,40 +925,45 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 		end
 	end
 
-	--Draw the overlay
-	if start.searchMode then
-		--Draw the search prompt, result count, and on-screen keyboard
-		local st = selectplus.Style
-		local n  = start.rosterFilter and #start.rosterFilter or 0
-		--A leading '@'/'#' switches the readout label to author/tag mode and hides the prefix
-		local q, label = start.searchQuery, 'SEARCH: '
-		local pfx = q:sub(1, 1)
-		if     pfx == '@' then q, label = q:sub(2), 'SEARCH AUTHOR: '
-		elseif pfx == '#' then q, label = q:sub(2), 'SEARCH TAG: ' end
-		if st.searchPrompt.show then drawStyledText(label .. q:upper() .. '_', st.searchPrompt.x, st.searchPrompt.y, st.searchPrompt.font, st.searchPrompt.color, st.searchPrompt.bank, st.searchPrompt.align, st.searchPrompt.scale) end
-		if st.foundCount.show   then drawStyledText(n .. ' FOUND',             st.foundCount.x,   st.foundCount.y,   st.foundCount.font, st.foundCount.color, st.foundCount.bank, st.foundCount.align, st.foundCount.scale) end
-		start.f_drawOnScreenKeyboard()
-	elseif selectplus.PageScrolling.enabled then
-		--Draw the page and size readout in the band under the mode title
-		local rp = start.rosterPage
-		local ir = selectplus.IconResize
-		local st = selectplus.Style
-		--Keep the active filter visible after the keyboard closes so it is clear what the grid is limited to
-		local tail = 'F3=SEARCH'
-		if start.rosterFilter ~= nil and start.searchQuery ~= '' then
-			local q = start.searchQuery
+	--Draw the overlay. Gated by 'locked': once both players finish picking characters the
+	--engine moves on to stage select and reuses stage.active's text sprite to show the
+	--highlighted stage's name, so drawing here past that point fights over the same sprite
+	--every frame and makes the stage name flicker unreadable.
+	if not locked then
+		if start.searchMode then
+			--Draw the search prompt, result count, and on-screen keyboard
+			local st = selectplus.Style
+			local n  = start.rosterFilter and #start.rosterFilter or 0
+			--A leading '@'/'#' switches the readout label to author/tag mode and hides the prefix
+			local q, label = start.searchQuery, 'SEARCH: '
 			local pfx = q:sub(1, 1)
-			if     pfx == '@' then tail = 'AUTHOR: ' .. q:sub(2):upper()
-			elseif pfx == '#' then tail = 'TAG: ' .. q:sub(2):upper()
-			else tail = 'FILTER: ' .. q:upper() end
-		end
-		if st.pageReadout.show then
-			drawStyledText('PAGE ' .. rp.current .. '/' .. rp.total
-				.. '   ' .. start.f_rosterCount() .. ' CHARS   ' .. tail, st.pageReadout.x, st.pageReadout.y, st.pageReadout.font, st.pageReadout.color, st.pageReadout.bank, st.pageReadout.align, st.pageReadout.scale)
-		end
-		if ir.enabled and st.sizeReadout.show then
-			drawStyledText('SIZE ' .. string.format('%.0f%%', ir.scale * 100)
-				.. '   F5/F6  /  L1+L2', st.sizeReadout.x, st.sizeReadout.y, st.sizeReadout.font, st.sizeReadout.color, st.sizeReadout.bank, st.sizeReadout.align, st.sizeReadout.scale)
+			if     pfx == '@' then q, label = q:sub(2), 'SEARCH AUTHOR: '
+			elseif pfx == '#' then q, label = q:sub(2), 'SEARCH TAG: ' end
+			if st.searchPrompt.show then drawStyledText(label .. q:upper() .. '_', st.searchPrompt.x, st.searchPrompt.y, st.searchPrompt.font, st.searchPrompt.color, st.searchPrompt.bank, st.searchPrompt.align, st.searchPrompt.scale) end
+			if st.foundCount.show   then drawStyledText(n .. ' FOUND',             st.foundCount.x,   st.foundCount.y,   st.foundCount.font, st.foundCount.color, st.foundCount.bank, st.foundCount.align, st.foundCount.scale) end
+			start.f_drawOnScreenKeyboard()
+		elseif selectplus.PageScrolling.enabled then
+			--Draw the page and size readout in the band under the mode title
+			local rp = start.rosterPage
+			local ir = selectplus.IconResize
+			local st = selectplus.Style
+			--Keep the active filter visible after the keyboard closes so it is clear what the grid is limited to
+			local tail = 'F3=SEARCH'
+			if start.rosterFilter ~= nil and start.searchQuery ~= '' then
+				local q = start.searchQuery
+				local pfx = q:sub(1, 1)
+				if     pfx == '@' then tail = 'AUTHOR: ' .. q:sub(2):upper()
+				elseif pfx == '#' then tail = 'TAG: ' .. q:sub(2):upper()
+				else tail = 'FILTER: ' .. q:upper() end
+			end
+			if st.pageReadout.show then
+				drawStyledText('PAGE ' .. rp.current .. '/' .. rp.total
+					.. '   ' .. start.f_rosterCount() .. ' CHARS   ' .. tail, st.pageReadout.x, st.pageReadout.y, st.pageReadout.font, st.pageReadout.color, st.pageReadout.bank, st.pageReadout.align, st.pageReadout.scale)
+			end
+			if ir.enabled and st.sizeReadout.show then
+				drawStyledText('SIZE ' .. string.format('%.0f%%', ir.scale * 100)
+					.. '   F5/F6  /  L1+L2', st.sizeReadout.x, st.sizeReadout.y, st.sizeReadout.font, st.sizeReadout.color, st.sizeReadout.bank, st.sizeReadout.align, st.sizeReadout.scale)
+			end
 		end
 	end
 end)
