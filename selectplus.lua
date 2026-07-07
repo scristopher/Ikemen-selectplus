@@ -19,7 +19,7 @@
 --=============================================================================
 
 local selectplus = {}
-selectplus.version = '0.12-rc6'
+selectplus.version = '0.13-density'
 
 --=============================================================================
 -- CONFIGURATION  edit this section to customise
@@ -71,18 +71,23 @@ selectplus.OnScreenKeyboard = {
     bgPasses   = 2,                            -- redraws to deepen the dim alpha
 }
 
---ICON RESIZE
--- Keyboard   : F5 = shrink, F6 = grow (fine, scaleStep at a time)
--- Controller : press BOTH shoulders (L1+L2) to cycle to the next preset size
+--ICON RESIZE (density, not zoom)
+-- Changes how many characters fit per page while keeping the grid inside the motif's
+-- own grid window, so it never overflows the panel. Bigger cells = fewer per page.
+-- Keyboard   : F6 = bigger cells (fewer), F5 = smaller cells (more) -- scaleStep at a time
+-- Controller : press BOTH shoulders (L1+L2) to cycle to the next density preset
+-- NOTE: needs a dynamic cell box (cell.bg.spr set in the motif). Screenpacks that paint the
+-- grid frame into static background art (cell.bg.spr = -1) can't re-flow it, so resize
+-- auto-disables on those to avoid sliding the faces off the frame.
 selectplus.IconResize = {
     enabled    = true,
-    scale      = 1.0,           -- current (1.0 = native)
-    scaleMin   = 0.5,           -- lower (F5/F6)
-    scaleMax   = 2.0,           -- upper (F5/F6)
+    scale      = 1.0,           -- cell-size multiplier vs the motif default (1.0 = native)
+    scaleMin   = 0.5,           -- smallest cells / most per page (F5/F6)
+    scaleMax   = 2.0,           -- biggest cells / fewest per page (F5/F6)
     scaleStep  = 0.1,           -- F5/F6 change per press
-    presets    = {0.7, 1.0, 1.3, 1.6, 2.0},  --  sizes the L1+L2 combo cycles through
+    presets    = {0.7, 1.0, 1.3, 1.6, 2.0},  -- density levels the L1+L2 combo cycles through
     keyboard   = { down = 'F5', up = 'F6' },   -- keyboard
-    controllerCombo = true,     -- L1+L2 cycles size set false to disable
+    controllerCombo = true,     -- L1+L2 cycles density set false to disable
 }
 
 --STYLE / THEMING
@@ -506,81 +511,156 @@ end
 --------------------------------------------------------------------------------
 --ICON RESIZE
 --------------------------------------------------------------------------------
---Capture the motif's original sizes once so every resize is computed from them without drift.
-local _irInit             = false
-local _ctrlHeld           = {}    --per-side latch for shoulder-button rising edges
-local _lastCmd            = {}    --per-side cmd, captured each frame so search can read whichever player is still browsing, not just p1
-local _irOrigGrid         = {}    --[row][col] = {x, y}
-local _irOrigPortraitSc   = nil   --portrait.scale  {x, y}  (default {1,1} if nil)
-local _irOrigPortraitOff  = nil   --portrait.offset {x, y}
-local _irOrigBgSc         = nil   --cell.bg.scale   {x, y}
-local _irOrigRandomSc     = nil   --cell.random.scale {x, y}
-local _irOrigCellSize     = nil   --cell.size  {w, h}  (used by cursor wrap check)
+--Resize by DENSITY, not zoom. The motif's default grid is treated as a fixed window; a
+--bigger cell size means fewer cells fit (and vice-versa), so the grid always stays inside
+--the screenpack's panel instead of scaling its positions in place and overflowing the frame.
+local _irInit    = false
+local _ctrlHeld  = {}     --per-side latch for shoulder-button rising edges
+local _lastCmd   = {}     --per-side cmd, captured each frame so search can read whichever player is still browsing, not just p1
+local _irBase    = nil    --the motif's default grid, captured once: the fixed window we re-flow within
+local _irStaticFrame = false  --true if the motif has no dynamic cell box (frame baked into static art); resize is skipped then
 
 local function initIconResize()
 	if _irInit then return end
-	local rows = motif.select_info.rows
-	local cols = motif.select_info.columns
-	for row = 1, rows do
-		_irOrigGrid[row] = {}
-		for col = 1, cols do
-			local g = start.t_grid[row] and start.t_grid[row][col]
-			if g then _irOrigGrid[row][col] = {x = g.x, y = g.y} end
-		end
-	end
+	local si = motif and motif.select_info
+	if si == nil then return end
 	--Guard every optional motif field so a screenpack that omits portrait/cell can't crash us.
-	local p  = motif.select_info.portrait or {}
-	local cs = motif.select_info.cell or {}
+	local cs = si.cell or {}
+	local sz = cs.size or {24, 24}
+	local sp = cs.spacing or {0, 0}
+	local p  = si.portrait or {}
 	local cb = cs.bg or {}
 	local cr = cs.random or {}
-	_irOrigPortraitSc  = p.scale  and {p.scale[1],  p.scale[2]}  or {1, 1}
-	_irOrigPortraitOff = p.offset and {p.offset[1], p.offset[2]} or {0, 0}
-	_irOrigBgSc        = cb.scale and {cb.scale[1], cb.scale[2]} or {1, 1}
-	_irOrigRandomSc    = cr.scale and {cr.scale[1], cr.scale[2]} or {1, 1}
-	_irOrigCellSize    = cs.size  and {cs.size[1],  cs.size[2]}  or {24, 24}
+	_irBase = {
+		rows = si.rows, cols = si.columns,
+		cellW = sz[1], cellH = sz[2],
+		spX = sp[1], spY = sp[2],
+		posX = (si.pos and si.pos[1]) or 0, posY = (si.pos and si.pos[2]) or 0,
+		portraitSc = (p.scale and {p.scale[1], p.scale[2]}) or {1, 1},
+		bgSc       = (cb.scale and {cb.scale[1], cb.scale[2]}) or {1, 1},
+		randomSc   = (cr.scale and {cr.scale[1], cr.scale[2]}) or {1, 1},
+		cursorSc   = {},   --base p1/p2 active/done cursor scales, so the cursor tracks cell size
+	}
+	for _, side in ipairs({'p1', 'p2'}) do
+		for _, st in ipairs({'active', 'done'}) do
+			--the engine reads the cursor scale from cursor[state].default.scale, not .scale
+			local cur = si[side] and si[side].cursor and si[side].cursor[st] and si[side].cursor[st].default
+			if cur ~= nil and cur.scale ~= nil then
+				_irBase.cursorSc[side .. st] = {cur.scale[1], cur.scale[2]}
+			end
+		end
+	end
+	--Detect a static grid frame: no dynamic cell background box (cell.bg.spr = -1 or absent)
+	--means the frame is painted into the screenpack art and can't move, so re-flowing would
+	--slide the faces off it. Resize is skipped on those packs (grid still renders at default).
+	local bgSpr = cb.spr
+	_irStaticFrame = (bgSpr == nil)
+		or (type(bgSpr) == 'number' and bgSpr < 0)
+		or (type(bgSpr) == 'table' and ((bgSpr[1] or 0) < 0))
 	_irInit = true
+end
+
+--Rebuild start.t_grid for the current rows/columns/cell.size. Replicates the engine's own
+--grid generation (via its global cell helpers) so a changed grid re-flows live and correctly.
+local function reflowGrid()
+	local si = motif.select_info
+	local cols, rows = si.columns, si.rows
+	local cw, ch = si.cell.size[1], si.cell.size[2]
+	start.t_grid = {}
+	for row = 1, rows do start.t_grid[row] = {} end
+	for i = 1, rows * cols do
+		local row = math.floor((i - 1) / cols) + 1
+		local col = ((i - 1) % cols) + 1
+		local spacing = (getCellSpacing ~= nil) and getCellSpacing(col - 1, row - 1) or {0, 0}
+		local offset  = (getCellOffset  ~= nil) and getCellOffset(col - 1, row - 1)  or {0, 0}
+		local g = {
+			x = (col - 1) * (cw + spacing[1]) + offset[1],
+			y = (row - 1) * (ch + spacing[2]) + offset[2],
+		}
+		local cd = start.f_selGrid(i)
+		if cd ~= nil and cd.char ~= nil then
+			g.char, g.char_ref, g.hidden = cd.char, cd.char_ref, cd.hidden
+		end
+		if (cd ~= nil and cd.skip == 1) or (getCellSkip ~= nil and getCellSkip(col - 1, row - 1)) then
+			g.skip = 1
+		end
+		start.t_grid[row][col] = g
+	end
+	start.needUpdateDrawList = true
 end
 
 local function applyIconResize(s)
 	initIconResize()
+	if _irBase == nil or _irStaticFrame then return end   --skip resize when the frame is static art
 	local ir = selectplus.IconResize
 	s = math.max(ir.scaleMin, math.min(ir.scaleMax, s))
 	s = math.floor(s * 100 + 0.5) / 100
 	ir.scale = s
+	local b  = _irBase
+	local si = motif.select_info
 
-	--Scale the cell positions that the cursor and draw list both read
-	local rows = motif.select_info.rows
-	local cols = motif.select_info.columns
-	for row = 1, rows do
-		for col = 1, cols do
-			local orig = _irOrigGrid[row] and _irOrigGrid[row][col]
-			local g    = start.t_grid[row] and start.t_grid[row][col]
-			if orig and g then
-				g.x = orig.x * s
-				g.y = orig.y * s
+	--Bigger cells -> fewer of them; smaller cells -> more. floor() keeps the grid inside
+	--(never larger than) the original window, so it can't overflow the panel.
+	local newCellW = math.max(1, math.floor(b.cellW * s + 0.5))
+	local newCellH = math.max(1, math.floor(b.cellH * s + 0.5))
+	local newCols  = math.max(1, math.floor(b.cols / s))
+	local newRows  = math.max(1, math.floor(b.rows / s))
+	si.columns = newCols
+	si.rows    = newRows
+	if si.cell ~= nil and si.cell.size ~= nil then
+		si.cell.size[1] = newCellW
+		si.cell.size[2] = newCellH
+	end
+
+	--Re-center the re-flowed grid within the original window footprint.
+	if si.pos ~= nil then
+		local origW = b.cols * (b.cellW + b.spX)
+		local origH = b.rows * (b.cellH + b.spY)
+		local newW  = newCols * (newCellW + b.spX)
+		local newH  = newRows * (newCellH + b.spY)
+		si.pos[1] = b.posX + math.floor((origW - newW) / 2 + 0.5)
+		si.pos[2] = b.posY + math.floor((origH - newH) / 2 + 0.5)
+	end
+
+	--Match the cell face / border / random sprites to the new cell size. Modify each scale
+	--table IN PLACE, not by replacement: the engine caches references to these tables, so a
+	--fresh table would be ignored (this is why the cursor didn't resize before).
+	if si.portrait ~= nil and si.portrait.scale ~= nil then
+		si.portrait.scale[1] = b.portraitSc[1] * s ; si.portrait.scale[2] = b.portraitSc[2] * s
+	end
+	if si.cell ~= nil and si.cell.bg ~= nil and si.cell.bg.scale ~= nil then
+		si.cell.bg.scale[1] = b.bgSc[1] * s ; si.cell.bg.scale[2] = b.bgSc[2] * s
+	end
+	if si.cell ~= nil and si.cell.random ~= nil and si.cell.random.scale ~= nil then
+		si.cell.random.scale[1] = b.randomSc[1] * s ; si.cell.random.scale[2] = b.randomSc[2] * s
+	end
+	--Scale the cursor sprites too, so the selection frame tracks the cell size. The engine
+	--reads the scale from cursor[state].default.scale (see f_drawCursor), so target that.
+	for _, side in ipairs({'p1', 'p2'}) do
+		for _, st in ipairs({'active', 'done'}) do
+			local cur  = si[side] and si[side].cursor and si[side].cursor[st] and si[side].cursor[st].default
+			local base = b.cursorSc[side .. st]
+			if cur ~= nil and cur.scale ~= nil and base ~= nil then
+				cur.scale[1] = base[1] * s ; cur.scale[2] = base[2] * s
 			end
 		end
 	end
 
-	--Scale the portrait sprite (guarded: some motifs omit portrait)
-	local p = motif.select_info.portrait
-	if p then
-		p.scale  = {_irOrigPortraitSc[1]  * s, _irOrigPortraitSc[2]  * s}
-		p.offset = {_irOrigPortraitOff[1] * s, _irOrigPortraitOff[2] * s}
+	--Recompute paging for the new page size, rebuild the grid, keep cursors in bounds.
+	start.f_updateRosterPageTotals()
+	reflowGrid()
+	if start.c ~= nil then
+		for _, c in pairs(start.c) do
+			if type(c) == 'table' and c.selX ~= nil then
+				if c.selX > newCols - 1 then c.selX = newCols - 1 end
+				if c.selY > newRows - 1 then c.selY = newRows - 1 end
+				c.cell = c.selX + newCols * c.selY
+			end
+		end
 	end
-
-	--Scale the cell background / size (guarded: some motifs omit cell.*)
-	local cs = motif.select_info.cell or {}
-	local cb = cs.bg
-	if cb then cb.scale = {_irOrigBgSc[1] * s, _irOrigBgSc[2] * s} end
-	local cr = cs.random
-	if cr then cr.scale = {_irOrigRandomSc[1] * s, _irOrigRandomSc[2] * s} end
-	if cs.size then cs.size = {_irOrigCellSize[1] * s, _irOrigCellSize[2] * s} end
-
-	start.needUpdateDrawList = true
 end
 
---Cycle to the next preset size
+--Cycle to the next preset density
 local function cycleIconSizePreset()
 	local ir = selectplus.IconResize
 	local p  = ir.presets
@@ -592,7 +672,7 @@ local function cycleIconSizePreset()
 	for i = 1, #p do
 		if p[i] > ir.scale + 0.001 then nextVal = p[i]; break end
 	end
-	applyIconResize(nextVal or p[1])      
+	applyIconResize(nextVal or p[1])
 end
 
 --Find first filled cell when paging forward, or the last when paging back.
@@ -960,7 +1040,7 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 				drawStyledText('PAGE ' .. rp.current .. '/' .. rp.total
 					.. '   ' .. start.f_rosterCount() .. ' CHARS   ' .. tail, st.pageReadout.x, st.pageReadout.y, st.pageReadout.font, st.pageReadout.color, st.pageReadout.bank, st.pageReadout.align, st.pageReadout.scale)
 			end
-			if ir.enabled and st.sizeReadout.show then
+			if ir.enabled and st.sizeReadout.show and not _irStaticFrame then
 				drawStyledText('SIZE ' .. string.format('%.0f%%', ir.scale * 100)
 					.. '   F5/F6  /  L1+L2', st.sizeReadout.x, st.sizeReadout.y, st.sizeReadout.font, st.sizeReadout.color, st.sizeReadout.bank, st.sizeReadout.align, st.sizeReadout.scale)
 			end
