@@ -19,7 +19,7 @@
 --=============================================================================
 
 local selectplus = {}
-selectplus.version = '0.13-density'
+selectplus.version = '0.14-split-readout'
 
 --=============================================================================
 -- CONFIGURATION  edit this section to customise
@@ -110,8 +110,14 @@ selectplus.Style = {
     --Defaults to the motif's own stage font (font = '') so this stays a single-file
     --drop-in with no bundled font assets. Point font at a screenpack-provided .def
     --(e.g. 'font/mine.def') to borrow a different look for one element.
-    pageReadout  = { show = true, x = nil, y = 110, font = '' }, -- "PAGE 1/1  N CHARS  F3=SEARCH"
-    sizeReadout  = { show = true, x = nil, y = 146, font = '' }, -- "SIZE 100%  F5/F6 / L1+L2"
+    --The page readout is three independently-placed pieces (pageReadout / charCount /
+    --searchHint) so a screenpack can tuck each into a clear margin around its grid instead
+    --of overlapping the tiles. They default to a simple stack under the mode title; give any
+    --of them an x / y / align to move it. (See the grid-margin EXAMPLE below.)
+    pageReadout  = { show = true, x = nil, y = 110, font = '' }, -- "PAGE 1/1"
+    charCount    = { show = true, x = nil, y = 140, font = '' }, -- "N CHARS"
+    searchHint   = { show = true, x = nil, y = 170, font = '' }, -- "F3=SEARCH", or the active filter once a search is applied
+    sizeReadout  = { show = true, x = nil, y = 200, font = '' }, -- "SIZE 100%  F5/F6 / L1+L2"
     searchPrompt = { show = true, x = 610, y = 632, font = '' }, -- "SEARCH: query_"
     foundCount   = { show = true, x = 610, y = 662, font = '' }, -- "N FOUND"
     --EXAMPLE (whole keyboard): font = 'font/mine.def', selFont = 'font/mine.def', bank = 1,
@@ -137,6 +143,14 @@ selectplus.Style = {
 --EXAMPLE: use a TrueType font for the search prompt. TrueType fonts have no built-in
 --color, so give them one explicitly or they render invisible.
 --selectplus.Style.searchPrompt = { show = true, x = 610, y = 632, font = 'font/mine-tt.def', color = {255,255,255}, scale = {0.85, 0.85} }
+
+--EXAMPLE: spread the three readout pieces into the margins around a grid instead of the
+--default stack -- PAGE above the grid's top-left corner, the search hint above the top-right,
+--and the roster count centered below the grid. Coordinates are for a grid spanning roughly
+--x323-901, y86-556 in a 1280x720 motif; align is -1 left, 0 center, 1 right.
+--selectplus.Style.pageReadout = { show = true, x = 323, y = 66,  align = -1, font = 'font/mine.def', bank = 1, scale = {0.5, 0.5} }
+--selectplus.Style.searchHint  = { show = true, x = 901, y = 66,  align =  1, font = 'font/mine.def', bank = 1, scale = {0.5, 0.5} }
+--selectplus.Style.charCount   = { show = true, x = 612, y = 582, align =  0, font = 'font/mine.def', bank = 1, scale = {0.5, 0.5} }
 
 --=============================================================================
 --END OF CONFIGURATION
@@ -248,6 +262,7 @@ end
 --------------------------------------------------------------------------------
 start.rosterPage = start.rosterPage or {current = 1, pageSize = 0, total = 1}
 start.rosterFilter    = nil
+start.rosterRealCount = nil
 start.rosterNameCache = nil
 start.rosterAuthorCache = nil
 start.rosterTagCache  = nil
@@ -262,6 +277,35 @@ function start.f_rosterCount()
 	if start.rosterFilter ~= nil then return #start.rosterFilter end
 	if main and main.t_selGrid then return #main.t_selGrid end
 	return 0
+end
+
+--Actual selectable-character count. The grid is padded with empty cells to fill whole pages,
+--so #t_selGrid is the grid capacity (rows*columns), NOT the roster size. Count the cells that
+--actually hold a character (skipping hidden/excluded/bonus/boss), independent of whether the
+--char's .def even sets a name -- a nameless char still occupies a slot. Cached for the session.
+function start.f_rosterRealCount()
+	if start.rosterRealCount ~= nil then return start.rosterRealCount end
+	local n = 0
+	if main and main.t_selGrid then
+		for i = 1, #main.t_selGrid do
+			local gc = main.t_selGrid[i]
+			if gc ~= nil and gc.chars ~= nil and #gc.chars > 0 then
+				local cd = main.t_selChars[gc.chars[gc.slot or 1]]
+				if cd ~= nil and cd.hidden ~= 2 and cd.exclude ~= 1 and cd.bonus ~= 1 and cd.boss ~= 1 then
+					n = n + 1
+				end
+			end
+		end
+	end
+	start.rosterRealCount = n
+	return n
+end
+
+--Count shown in the "N CHARS" readout: the filtered result count while a search is active,
+--otherwise the real roster size (not the padded grid capacity that f_rosterCount reports).
+function start.f_rosterDisplayCount()
+	if start.rosterFilter ~= nil then return #start.rosterFilter end
+	return start.f_rosterRealCount()
 end
 
 function start.f_updateRosterPageTotals()
@@ -1036,9 +1080,18 @@ hook.add('start.f_selectScreen', 'selectplus', function()
 				elseif pfx == '#' then tail = 'TAG: ' .. q:sub(2):upper()
 				else tail = 'FILTER: ' .. q:upper() end
 			end
+			--Three independently-placed pieces (see Style): page number, roster count, search hint.
 			if st.pageReadout.show then
-				drawStyledText('PAGE ' .. rp.current .. '/' .. rp.total
-					.. '   ' .. start.f_rosterCount() .. ' CHARS   ' .. tail, st.pageReadout.x, st.pageReadout.y, st.pageReadout.font, st.pageReadout.color, st.pageReadout.bank, st.pageReadout.align, st.pageReadout.scale)
+				drawStyledText('PAGE ' .. rp.current .. '/' .. rp.total,
+					st.pageReadout.x, st.pageReadout.y, st.pageReadout.font, st.pageReadout.color, st.pageReadout.bank, st.pageReadout.align, st.pageReadout.scale)
+			end
+			if st.charCount and st.charCount.show then
+				drawStyledText(start.f_rosterDisplayCount() .. ' CHARS',
+					st.charCount.x, st.charCount.y, st.charCount.font, st.charCount.color, st.charCount.bank, st.charCount.align, st.charCount.scale)
+			end
+			if st.searchHint and st.searchHint.show then
+				drawStyledText(tail,
+					st.searchHint.x, st.searchHint.y, st.searchHint.font, st.searchHint.color, st.searchHint.bank, st.searchHint.align, st.searchHint.scale)
 			end
 			if ir.enabled and st.sizeReadout.show and not _irStaticFrame then
 				drawStyledText('SIZE ' .. string.format('%.0f%%', ir.scale * 100)
